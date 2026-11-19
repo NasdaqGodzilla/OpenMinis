@@ -6,7 +6,16 @@ sealed class LLMStreamChunk {
     data object Started : LLMStreamChunk()
     data class Text(val text: String) : LLMStreamChunk()
     data class Usage(val usage: LLMUsage) : LLMStreamChunk()
-    data class Finished(val stopReason: String?) : LLMStreamChunk()
+    /**
+     * [FIX-261018-12] `refusalCategory` / `refusalExplanation`: Anthropic's
+     * `stop_details` when `stopReason` is "refusal" (e.g. category "cyber"),
+     * so the reply can say WHY it was refused. Null for everything else.
+     */
+    data class Finished(
+        val stopReason: String?,
+        val refusalCategory: String? = null,
+        val refusalExplanation: String? = null,
+    ) : LLMStreamChunk()
 
     /** Thinking/reasoning streaming event */
     data class ThinkingDelta(val text: String) : LLMStreamChunk()
@@ -19,7 +28,16 @@ sealed class LLMStreamChunk {
     /** Tool use streaming events */
     data class ToolUseStart(val id: String, val name: String) : LLMStreamChunk()
     data class ToolInputDelta(val id: String, val accumulated: String) : LLMStreamChunk()
-    data class ToolCallComplete(val id: String, val name: String, val args: JSONObject) : LLMStreamChunk()
+    data class ToolCallComplete(
+        val id: String,
+        val name: String,
+        val args: JSONObject,
+        // [T-android-gemini3-thoughtsig / #179] Gemini 3.x returns a
+        // `thoughtSignature` on each functionCall part; it MUST be replayed on
+        // the historical functionCall or the next request 400s. Null for every
+        // other provider (only Gemini populates it).
+        val thoughtSignature: String? = null,
+    ) : LLMStreamChunk()
 
     /**
      * [T-codex-gpt-image2-oauth-android] A model-generated media attachment

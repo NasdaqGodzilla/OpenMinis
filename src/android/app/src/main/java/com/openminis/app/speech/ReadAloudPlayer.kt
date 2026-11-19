@@ -1,10 +1,12 @@
 package com.openminis.app.speech
 
 import android.content.Context
+import android.media.AudioManager
 import android.media.MediaPlayer
-import android.util.Log
+import android.widget.Toast
 import com.openminis.app.MinisApp
 import com.openminis.app.R
+import com.openminis.app.logging.AppLogger
 import com.openminis.app.provider.voice.VoiceOutputRequest
 import com.openminis.app.provider.voice.VoiceProviderFactory
 import kotlinx.coroutines.CoroutineScope
@@ -69,6 +71,19 @@ class ReadAloudPlayer(context: Context) {
     /** Currently playing provider audio, if any — held so [stop] can cancel it. */
     private var player: MediaPlayer? = null
 
+    /** [T-readaloud-volume-boost] Volume above 100 % on [player]'s session. */
+    private var playerBoost: ReadAloudBoost? = null
+
+    /**
+     * [T-readaloud-volume-boost] The system engine plays on an audio session
+     * of our own (KEY_PARAM_SESSION_ID), so the boost above 100 % can sit on
+     * it. 0 when no session could be allocated: then no boost, as before.
+     */
+    private val systemSessionId: Int = runCatching {
+        appContext.getSystemService(AudioManager::class.java).generateAudioSessionId()
+    }.getOrDefault(0).coerceAtLeast(0)
+    private val systemBoost = ReadAloudBoost(systemSessionId)
+
     /**
      * Completes the in-flight [playBytes] suspension when [stop] tears the
      * MediaPlayer down. Releasing the player means its completion/error
@@ -77,11 +92,43 @@ class ReadAloudPlayer(context: Context) {
      */
     private var playbackFinisher: (() -> Unit)? = null
 
+    /**
+     * [T-android-tts-broken-listener] Latched once the system engine misses a
+     * completion callback. Some OEM engines speak fine but never deliver
+     * UtteranceProgressListener events; without this every sentence waited out
+     * its whole (>=10 s) budget and was then cut off mid-word.
+     */
+    @Volatile
+    private var progressListenerBroken = false
+
     /** Utterances enqueued but not yet finished; drives [isSpeaking]. */
     private val pending = AtomicInteger(0)
 
+    /**
+     * [T-android-tts-player-registry] True when THIS player owns the capsule.
+     *
+     * Two players can be alive at once (the reply channel, and the selection
+     * Read-Aloud player). Both used to write the shared
+     * isSpeaking/isSynthesizing/activeModelLabel mirrors unconditionally, so a
+     * background player's state flickered the capsule of the foreground one.
+     * Only the registry's top may drive the UI.
+     */
+    private fun ownsCapsule(): Boolean = VoiceOutputState.isActivePlayer(this)
+
     private val _isSpeaking = MutableStateFlow(false)
     val isSpeaking: StateFlow<Boolean> = _isSpeaking.asStateFlow()
+
+    /**
+     * [T-readaloud-focus] Shared MAY_DUCK focus holder for both engines, held
+     * across a whole run of sentences (see [ReadAloudAudioFocus]).
+     */
+    private val focus = ReadAloudAudioFocus.shared(appContext)
+
+    /** Another app took focus (call, music started): stop, as a user stop would. */
+    private val onFocusLost: () -> Unit = {
+        AppLogger.info(TAG, "audio focus lost — stopping read-aloud")
+        stop()
+    }
 
     /**
      * Rolling buffer for streaming input. Mirrors [TextToSpeechManager]'s own
@@ -89,6 +136,20 @@ class ReadAloudPlayer(context: Context) {
      * decision (each sentence is independently a provider or system utterance).
      */
     private val sentenceBuffer = StringBuilder()
+
+    /**
+     * [T-android-tts-stop-on-capture] Utterances parked by [suspendForCapture]
+     * while the microphone is open, replayed by [resumeAfterCapture].
+     *
+     * Guarded by the same main-thread confinement the rest of this class
+     * relies on (see the queue-state note on [stop]) — both entry points are
+     * driven from the recognizer's state flow, which is collected on main.
+     */
+    private val heldForCapture = mutableListOf<String>()
+
+    /** True between [suspendForCapture] and [resumeAfterCapture]/[stop]. */
+    @Volatile
+    private var capturePaused = false
 
     private val linkPhrases by lazy {
         VoiceTextSanitizer.LinkPhrases(
@@ -98,13 +159,50 @@ class ReadAloudPlayer(context: Context) {
     }
 
     init {
+        // [T-android-tts-capsule] Register as the active player so the global
+        // capsule's mute/close/stop actions reach this instance, and mirror the
+        // live speaking flag into the global state the capsule renders from.
+        VoiceOutputState.init(appContext)
+        VoiceOutputState.registerPlayer(this)
         worker = scope.launch {
             for (text in queue) {
-                runCatching { speakOne(text) }
-                    .onFailure { Log.e(TAG, "utterance failed", it) }
+                try {
+                    runCatching { speakOne(text) }
+                        .onFailure { AppLogger.error(TAG, "utterance failed: $it") }
+                } finally {
+                    // [T-readaloud-focus] Every utterance ends here — done,
+                    // failed, or cancelled — so focus can never outlive it by
+                    // more than the window. The next sentence starting inside
+                    // it keeps focus held without a re-request. `pending` still
+                    // counts this utterance, so > 1 means another is queued and
+                    // only waiting on synthesis: hold longer for it.
+                    val moreQueued = pending.get() > 1
+                    focus.releaseSoon(
+                        this@ReadAloudPlayer,
+                        if (moreQueued) ReadAloudAudioFocus.SYNTH_WAIT_MS else ReadAloudAudioFocus.GRACE_MS,
+                    )
+                }
                 // Queue drained → speech is over. Counter rather than
                 // Channel.isEmpty, which is experimental API.
-                if (pending.decrementAndGet() <= 0) _isSpeaking.value = false
+                if (pending.decrementAndGet() <= 0) {
+                    _isSpeaking.value = false
+                    if (ownsCapsule()) VoiceOutputState.isSpeaking.value = false
+                }
+            }
+        }
+        // [T-readaloud-volume] Follow the read-aloud volume slider live on the
+        // provider path: MediaPlayer.setVolume applies to audio already
+        // playing, so the sentence being read changes as the thumb moves. The
+        // system engine cannot do this (KEY_PARAM_VOLUME is per utterance);
+        // speakViaSystem picks the value up from the next sentence.
+        // [T-readaloud-volume-boost] The part above 100 % is an effect on the
+        // audio session, so it follows the thumb live on both paths.
+        scope.launch {
+            VoiceOutputState.volume.collect { v ->
+                val gain = ReadAloudBoost.linearGain(v)
+                player?.runCatching { setVolume(gain, gain) }
+                playerBoost?.apply(v)
+                systemBoost.apply(v)
             }
         }
     }
@@ -125,29 +223,141 @@ class ReadAloudPlayer(context: Context) {
     /** Emit the buffered tail (a fragment with no terminator). Call at stream end. */
     fun flush() {
         if (sentenceBuffer.isEmpty()) return
+        // [T-android-tts-scope-align] Terminal extraction first (streaming =
+        // false): a held-back unclosed code fence is dropped here rather than
+        // spoken raw, and a trailing decimal look-ahead commits. Only the
+        // genuine no-terminator remainder goes out as the tail unit.
+        for (s in SpeechSentenceSplitter.extractCompleteSentences(sentenceBuffer, streaming = false)) {
+            enqueue(s)
+        }
         val tail = sentenceBuffer.toString().trim()
         sentenceBuffer.setLength(0)
         if (tail.isNotEmpty()) enqueue(tail)
     }
 
-    /** Speak [text] as a single utterance, after stopping anything in flight. */
+    /**
+     * Speak [text] after stopping anything in flight, one sentence per queued
+     * utterance.
+     *
+     * [T-android-readaloud-split] It used to be ONE utterance. "Read from
+     * Start" passes a whole reply, and the system engine refuses input longer
+     * than `TextToSpeech.getMaxSpeechInputLength()` (~4000 chars): speak()
+     * returns ERROR and nothing plays, so a long reply was silent even with
+     * read-replies on. iOS `readReplyFromStart` splits into sentences first
+     * and queues each; this does the same through the streaming path's own
+     * splitter and [flush], so a menu read and live reply TTS cut text the
+     * same way (and provider TTS gets request-sized pieces too).
+     */
     fun speak(text: String) {
         stop()
+        sentenceBuffer.append(text)
+        flush()
+    }
+
+    /**
+     * Speak [text] AFTER whatever is already queued, without interrupting it.
+     *
+     * [speak] stops playback first, which is right for a user-initiated "read
+     * this" but wrong for an announcement that has to slot into a running
+     * narration — a tool announcement must follow the sentence that preceded
+     * the tool call and precede whatever the model says next. Mirrors iOS
+     * `speakQueued` (AIChatViewModel+SSEStream), which exists for the same
+     * reason.
+     *
+     * Goes through [enqueue], so it inherits the mute / mic-capture / sanitize
+     * gating rather than re-deriving it.
+     */
+    fun speakQueued(text: String) {
+        if (text.isBlank()) return
         enqueue(text)
     }
 
     private fun enqueue(raw: String) {
+        // [T-android-tts-capsule] Temporary mute suppresses NEW utterances too
+        // (not only current playback) — matching iOS, where `canPlay =
+        // isEnabled && !isMuted` gates production. Dropping here rather than at
+        // playback keeps a long mute from piling up a backlog that would all
+        // blurt out on un-mute.
+        if (!VoiceOutputState.canPlay) return
+        // [T-android-tts-scope-align] Mic-capture suppression, from iOS
+        // canSpeakNow (feedDynamicTTS logs "DROP — read-replies off
+        // (capturing)"): while the VAD/recognizer is actively capturing,
+        // reply TTS must not play — the speaker feeds straight back into the
+        // dictation mic (echo), and capture/playback also fight over the
+        // audio route. iOS drops the text outright; mirrored here.
+        val recState = SpeechRecognitionManager.state.value
+        if (recState == RecognitionState.RECORDING || recState == RecognitionState.STARTING) {
+            AppLogger.info(TAG, "enqueue dropped — mic capturing (state=$recState)")
+            return
+        }
         // Sanitize here, not at playback: a chunk that is pure Markdown (e.g. a
         // fenced code block) sanitizes to empty and must not occupy the queue.
         val clean = VoiceTextSanitizer.sanitize(raw, linkPhrases)
         if (clean.isBlank()) return
         pending.incrementAndGet()
         _isSpeaking.value = true
+        if (ownsCapsule()) VoiceOutputState.isSpeaking.value = true
         queue.trySend(clean)
+    }
+
+    /**
+     * [T-android-tts-stop-on-capture] Silence playback for a dictation turn,
+     * KEEPING what has not been spoken yet so [resumeAfterCapture] can pick it
+     * back up.
+     *
+     * Distinct from [stop], which drops the queue: this is a pause, not a
+     * cancel. The utterance that is mid-playback is abandoned (there is no
+     * seek-within-utterance on either engine, and re-speaking a whole paragraph
+     * to recover two words is worse than losing them), but everything still
+     * queued behind it is preserved and re-queued on resume.
+     */
+    fun suspendForCapture() {
+        if (capturePaused) return
+        capturePaused = true
+        // Drain into the holding list rather than onto the floor.
+        val held = mutableListOf<String>()
+        while (true) {
+            val r = queue.tryReceive()
+            if (r.isSuccess) held.add(r.getOrThrow()) else break
+        }
+        // The un-terminated tail counts as pending speech too.
+        val tail = sentenceBuffer.toString().trim()
+        sentenceBuffer.setLength(0)
+        if (tail.isNotEmpty()) held.add(tail)
+        heldForCapture.addAll(held)
+
+        playbackFinisher?.invoke()
+        releasePlayer()
+        system.stop()
+        focus.releaseNow(this)
+        pending.set(0)
+        _isSpeaking.value = false
+        if (ownsCapsule()) {
+            VoiceOutputState.isSpeaking.value = false
+            VoiceOutputState.isSynthesizing.value = false
+        }
+        AppLogger.info(TAG, "suspended for mic capture — held ${heldForCapture.size} utterance(s)")
+    }
+
+    /** Re-queue whatever [suspendForCapture] held back. */
+    fun resumeAfterCapture() {
+        if (!capturePaused) return
+        capturePaused = false
+        if (heldForCapture.isEmpty()) return
+        val toSpeak = heldForCapture.toList()
+        heldForCapture.clear()
+        // Back through enqueue so the mute / still-capturing / sanitize gates
+        // all re-apply — the user may have muted or started talking again
+        // while we were paused.
+        toSpeak.forEach { enqueue(it) }
+        AppLogger.info(TAG, "resumed after mic capture — re-queued ${toSpeak.size} utterance(s)")
     }
 
     /** Stop playback and drop everything pending. */
     fun stop() {
+        // A real stop supersedes a capture pause: nothing held is still wanted.
+        capturePaused = false
+        heldForCapture.clear()
         sentenceBuffer.setLength(0)
         while (queue.tryReceive().isSuccess) { /* drain */ }
         // Unblock the worker BEFORE releasing, so the in-flight utterance's
@@ -156,8 +366,14 @@ class ReadAloudPlayer(context: Context) {
         playbackFinisher?.invoke()
         releasePlayer()
         system.stop()
+        // [T-readaloud-focus] Stop / mute / disable / dispose: no grace.
+        focus.releaseNow(this)
         pending.set(0)
         _isSpeaking.value = false
+        if (ownsCapsule()) {
+            VoiceOutputState.isSpeaking.value = false
+            if (ownsCapsule()) VoiceOutputState.isSynthesizing.value = false
+        }
     }
 
     /** Release both engines. Call from the owner's DisposableEffect. */
@@ -167,6 +383,11 @@ class ReadAloudPlayer(context: Context) {
         queue.close()
         scope.cancel()
         system.shutdown()
+        systemBoost.release()
+        // Deregister by identity: removing a mid-stack player leaves the rest
+        // intact, and dropping the top hands the capsule back to the player
+        // beneath (typically the reply channel) instead of orphaning it.
+        VoiceOutputState.unregisterPlayer(this)
     }
 
     // -- internals --
@@ -178,14 +399,53 @@ class ReadAloudPlayer(context: Context) {
 
         if (entry != null) {
             val (instance, modelEntry) = entry
+            // [T-android-tts-capsule] Surface the ACTUALLY-synthesizing model
+            // on the capsule's chip (falls back to the system label below when
+            // this path fails over).
+            if (ownsCapsule()) {
+                VoiceOutputState.activeModelLabel.value =
+                    modelEntry.model.displayName.ifBlank { modelEntry.model.id }
+            }
             val ok = runCatching { speakViaProvider(instance, modelEntry, text) }
                 .getOrElse {
-                    Log.w(TAG, "provider TTS failed, falling back to system engine", it)
+                    AppLogger.error(
+                        TAG,
+                        "provider TTS failed (model=${modelEntry.model.id} " +
+                            "vendor=${instance.providerType}), falling back to system engine: $it",
+                    )
                     false
                 }
             if (ok) return
         }
-        speakViaSystem(text)
+        if (ownsCapsule()) VoiceOutputState.activeModelLabel.value = null // system engine
+        if (!speakViaSystem(text)) {
+            // [T-android-tts-silent-blackhole] Terminal state: the provider path
+            // did not produce audio AND the device speech engine is unusable.
+            // iOS can't reach this (AVSpeechSynthesizer always exists), which is
+            // why read-aloud "just works" there while Android could go silent
+            // with no feedback at all — the reported OPPO symptom. Tell the user
+            // once instead of swallowing it.
+            notifySpeechUnavailable(providerConfigured = entry != null)
+        }
+    }
+
+    /** One-shot user-visible signal that read-aloud cannot produce sound. */
+    private var unavailableNotified = false
+
+    private fun notifySpeechUnavailable(providerConfigured: Boolean) {
+        AppLogger.error(
+            TAG,
+            "read-aloud produced NO audio: providerConfigured=$providerConfigured " +
+                "systemEngine=${if (system.initFailed) "init-failed" else "unavailable"}",
+        )
+        if (unavailableNotified) return
+        unavailableNotified = true
+        // The worker runs on Dispatchers.Main.immediate, so Toast is safe here.
+        Toast.makeText(
+            appContext,
+            appContext.getString(R.string.read_aloud_unavailable),
+            Toast.LENGTH_LONG,
+        ).show()
     }
 
     /** @return true when provider audio was synthesized AND played. */
@@ -194,24 +454,51 @@ class ReadAloudPlayer(context: Context) {
         modelEntry: com.openminis.app.data.model.ModelEntry,
         text: String,
     ): Boolean {
-        val repo = (appContext as? MinisApp)?.providerRepository ?: return false
-        val apiKey = repo.loadApiKey(instance.id) ?: return false
-        val voice = VoiceProviderFactory.make(instance, apiKey) ?: return false
-        if (!voice.supportsVoiceOutput) return false
-
-        val data = withContext(Dispatchers.IO) {
-            voice.synthesize(
-                // The entry id doubles as the voice id — template voices carry
-                // the voice id as the model id (same convention QuickTestSheet
-                // relies on, iOS 0a52bdbf).
-                VoiceOutputRequest(
-                    input = text,
-                    model = modelEntry.model.id,
-                    voice = modelEntry.model.id,
-                ),
-            )
+        // [T-android-safemode-lateinit-crash-147] `?.` guards a null
+        // Application but NOT an unassigned lateinit — the getter throws.
+        // Read-aloud can be driven from a notification action with no
+        // Activity, so gate on subsystemsReady() before touching a repository.
+        // Each bail-out logs its reason: these gates used to return false
+        // silently, which made "no sound" undiagnosable from a user device
+        // (the daily log files showed nothing at all).
+        val repo = (appContext as? MinisApp)
+            ?.takeIf { it.subsystemsReady() }
+            ?.providerRepository
+            ?: return false.also { AppLogger.error(TAG, "provider TTS skipped: repository unavailable") }
+        val apiKey = repo.loadApiKey(instance.id)
+            ?: return false.also { AppLogger.error(TAG, "provider TTS skipped: no API key for ${instance.id}") }
+        val voice = VoiceProviderFactory.make(instance, apiKey)
+            ?: return false.also { AppLogger.error(TAG, "provider TTS skipped: no voice adapter for ${instance.providerType}/${instance.customBaseURL}") }
+        if (!voice.supportsVoiceOutput) {
+            AppLogger.error(TAG, "provider TTS skipped: ${voice.javaClass.simpleName} does not support output")
+            return false
         }
-        if (data.isEmpty()) return false
+
+        // [T-android-tts-capsule] Drives the capsule's rotating-arc loading
+        // indicator while the network request is in flight (iOS
+        // voicePlayer.isSynthesizing).
+        if (ownsCapsule()) VoiceOutputState.isSynthesizing.value = true
+        val data = try {
+            withContext(Dispatchers.IO) {
+                voice.synthesize(
+                    // The entry id doubles as the voice id — template voices carry
+                    // the voice id as the model id (same convention QuickTestSheet
+                    // relies on, iOS 0a52bdbf).
+                    VoiceOutputRequest(
+                        input = text,
+                        model = modelEntry.model.id,
+                        voice = modelEntry.model.id,
+                        resolvedModel = modelEntry.model,
+                    ),
+                )
+            }
+        } finally {
+            VoiceOutputState.isSynthesizing.value = false
+        }
+        if (data.isEmpty()) {
+            AppLogger.error(TAG, "provider TTS returned empty audio (model=${modelEntry.model.id})")
+            return false
+        }
         playBytes(data)
         return true
     }
@@ -239,17 +526,51 @@ class ReadAloudPlayer(context: Context) {
             // the player, since the callbacks below can no longer fire.
             playbackFinisher = ::finish
             runCatching {
+                // [T-android-tts-silent-blackhole] Explicit attributes + audio
+                // focus. iOS routes playback through AudioSessionCoordinator;
+                // Android had neither, and some OEM ROMs (ColorOS among them)
+                // will silently mute focus-less media playback. Focus denial is
+                // logged but non-fatal — muting is the exception, not the rule.
+                // [T-readaloud-focus] Focus is now the shared run-long holder,
+                // acquired just before start() below.
+                mp.setAudioAttributes(ReadAloudAudioFocus.ATTRIBUTES)
                 mp.setDataSource(file.absolutePath)
                 mp.setOnCompletionListener { finish() }
                 mp.setOnErrorListener { _, what, extra ->
-                    Log.w(TAG, "MediaPlayer error what=$what extra=$extra")
+                    AppLogger.error(TAG, "MediaPlayer error what=$what extra=$extra")
                     finish()
                     true
                 }
                 mp.prepare()
+                // [T-readaloud-volume] Same read-aloud volume as the system
+                // path; the collector in init keeps it in step while playing.
+                // [T-readaloud-volume-boost] Up to 100 % on the player, the
+                // rest as a LoudnessEnhancer on its session.
+                val volume = VoiceOutputState.volume.value
+                val gain = ReadAloudBoost.linearGain(volume)
+                mp.setVolume(gain, gain)
+                playerBoost = ReadAloudBoost(mp.audioSessionId).also { it.apply(volume) }
+                logVolume("provider", volume)
+                // [T-android-tts-rom-compat] start() FIRST, speed second, each
+                // in its own guard. The previous order relied on
+                // setPlaybackParams-on-prepared implicitly starting playback —
+                // documented AOSP behaviour, but some OEM MediaPlayer builds
+                // throw IllegalStateException there, and the failure landed in
+                // the OUTER runCatching which skipped the utterance entirely.
+                // Now a ROM that rejects the speed change still plays at 1×;
+                // only the speed is lost, never the audio.
+                focus.acquire(this@ReadAloudPlayer, onFocusLost)
                 mp.start()
+                val speed = VoiceOutputState.speed.value
+                if (speed != 1.0f) {
+                    runCatching {
+                        mp.playbackParams = mp.playbackParams.setSpeed(speed)
+                    }.onFailure {
+                        AppLogger.error(TAG, "playback speed $speed rejected by this ROM's MediaPlayer, playing at 1×: $it")
+                    }
+                }
             }.onFailure {
-                Log.w(TAG, "MediaPlayer setup failed", it)
+                AppLogger.error(TAG, "MediaPlayer setup failed: $it")
                 finish()
             }
             cont.invokeOnCancellation { releasePlayer() }
@@ -260,17 +581,112 @@ class ReadAloudPlayer(context: Context) {
      * Speak via the on-device engine and wait for it to finish, so the queue
      * stays ordered. [TextToSpeechManager.isSpeaking] flips false on the last
      * utterance's onDone.
+     *
+     * @return false when the engine is unusable (init failed / never bound) —
+     *   the caller surfaces that instead of pretending the sentence was spoken.
      */
-    private suspend fun speakViaSystem(text: String) {
+    private suspend fun speakViaSystem(text: String): Boolean {
+        // [T-android-tts-silent-blackhole] Engine binding is async; speaking
+        // before it settles used to drop the text on the floor. Wait (bounded)
+        // for a verdict first.
+        if (!system.awaitReady()) return false
+        // [T-android-tts-capsule] Apply the capsule's speed each utterance —
+        // the property setter forwards to tts.setSpeechRate, so mid-reply
+        // speed changes take effect from the next sentence.
+        system.speechRate = VoiceOutputState.speed.value
+        // [T-android-system-voice-catalog] Apply the picked system voice (null
+        // = engine default / auto language), and surface its label on the
+        // capsule chip — matching iOS, whose chip shows "Tingting (Chinese)"
+        // rather than a generic "System TTS" once a voice is chosen.
+        system.preferredVoiceName = VoiceOutputState.systemVoiceName.value
+        // [T-readaloud-volume] Per-utterance gain via KEY_PARAM_VOLUME
+        // (buildSpeechParams), capped at 1.0 by the engine.
+        // [T-readaloud-volume-boost] Above 100 % the utterance plays on our own
+        // session, which carries the LoudnessEnhancer for the rest.
+        val volume = VoiceOutputState.volume.value
+        system.speechVolume = ReadAloudBoost.linearGain(volume)
+        system.audioSessionId = systemSessionId
+        systemBoost.apply(volume)
+        logVolume("system", volume)
+        if (ownsCapsule()) {
+            VoiceOutputState.activeModelLabel.value = VoiceOutputState.systemVoiceLabel.value
+        }
+        // [T-readaloud-focus] The system engine now ducks other apps too.
+        focus.acquire(this, onFocusLost)
         system.speak(text)
+        // [T-android-tts-rom-compat] speak() may have been REJECTED by the
+        // engine (missing language data on AOSP/OEM engines) — the manager
+        // clears isSpeaking in that case, so the loop below exits immediately
+        // and we report failure instead of pretending the text was spoken.
+        if (!system.isSpeaking.value) return false
         // Poll rather than plumb a callback through: utterances are short and
         // this keeps TextToSpeechManager's public surface unchanged.
+        //
+        // [T-android-tts-rom-compat] BOUNDED. Some OEM engines accept the
+        // utterance but never deliver UtteranceProgressListener callbacks
+        // (fragmented listener support), which left this loop spinning forever
+        // and wedged the whole read-aloud queue. Budget scales with length —
+        // generous enough for 0.5× zh speech — and on expiry we log and move
+        // on rather than freeze the worker for the rest of the process.
+        // [T-android-tts-broken-listener] Once this engine has proved its
+        // progress listener never fires, stop paying the budget on EVERY
+        // sentence. Estimate the duration instead and let the utterance run to
+        // completion — crucially without stop(), which is what used to cut
+        // words in half.
+        if (progressListenerBroken) {
+            kotlinx.coroutines.delay(estimatedSpeechMs(text))
+            return true
+        }
+        val budgetMs = (text.length * 600L + 10_000L).coerceAtMost(180_000L)
+        val deadline = System.currentTimeMillis() + budgetMs
+        var timedOut = false
         while (system.isSpeaking.value) {
+            if (System.currentTimeMillis() > deadline) {
+                AppLogger.error(
+                    TAG,
+                    "system TTS completion never reported (len=${text.length}, " +
+                        "waited ${budgetMs}ms) — engine's progress listener is broken; moving on",
+                )
+                timedOut = true
+                break
+            }
             kotlinx.coroutines.delay(POLL_MS)
         }
+        if (timedOut) {
+            // Do NOT system.stop() here. The engine is very likely still
+            // speaking correctly — only its CALLBACKS are broken — so stopping
+            // truncates the sentence mid-word. The next utterance uses
+            // QUEUE_FLUSH anyway, so ordering is preserved without it.
+            //
+            // Report failure so the "read-aloud unavailable" path runs ONCE,
+            // and latch the flag so subsequent sentences take the estimated
+            // -duration path above instead of burning >=10 s of dead air each.
+            progressListenerBroken = true
+            return false
+        }
+        return true
+    }
+
+    /**
+     * Rough utterance duration for the broken-listener path. Deliberately on
+     * the short side of real speech: overlapping slightly is far less bad than
+     * the multi-second dead air the full budget produced.
+     */
+    private fun estimatedSpeechMs(text: String): Long =
+        (text.length * 90L + 400L).coerceIn(600L, 30_000L)
+
+    /** Last (path, volume) logged — one line per change, not per sentence. */
+    private var lastVolumeLog: Pair<String, Float>? = null
+
+    private fun logVolume(path: String, volume: Float) {
+        if (lastVolumeLog == path to volume) return
+        lastVolumeLog = path to volume
+        AppLogger.info(TAG, "read-aloud volume=$volume path=$path")
     }
 
     private fun releasePlayer() {
+        playerBoost?.release()
+        playerBoost = null
         player?.runCatching {
             if (isPlaying) stop()
             release()
